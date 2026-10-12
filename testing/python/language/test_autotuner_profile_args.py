@@ -1,11 +1,13 @@
 """Autotune cache identity and measurement consume the same profiling settings."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import tilelang
 from tilelang.autotuner import tuner as tuner_module
+from tilelang.engine.param import KernelParam
 
 
 def _factory(block=32):
@@ -51,8 +53,7 @@ def tuner(monkeypatch):
         def get_kernel_source(self):
             return "// mock kernel"
 
-        def update_tuner_result(self, **kwargs):
-            return self
+        update_tuner_result = tilelang.JITKernel.update_tuner_result
 
     generate_key = autotuner.generate_cache_key
 
@@ -127,6 +128,80 @@ def test_run_overrides_apply_only_to_current_call(tuner):
     ]
     assert calls.timeouts == [17, 13, 13]
     assert len(set(calls.saved_keys)) == 3
+
+
+def test_profile_cache_round_trips_through_disk(tuner, monkeypatch, tmp_path):
+    autotuner, calls = tuner
+    monkeypatch.delattr(autotuner, "_load_result_from_disk")
+    monkeypatch.delattr(autotuner, "_save_result_to_disk")
+    monkeypatch.setattr(tuner_module.AutoTuner, "cache_dir", tmp_path / "cache")
+    library = tmp_path / "compiled.so"
+    library.write_bytes(b"mock compiled library")
+    create_kernel = autotuner.jit_compile
+    compiles = []
+    restores = []
+
+    def compile_kernel(**config):
+        compiles.append(config)
+        kernel = create_kernel(**config)
+        kernel.prim_func = _factory
+        kernel.kernel_source = kernel.get_kernel_source()
+        kernel.params = [KernelParam(tuner_module.torch.float32, [1])]
+        kernel.auto_gm_idx = []
+        kernel.adapter = SimpleNamespace(libpath=str(library))
+        return kernel
+
+    def restore_kernel(**kwargs):
+        # Keep the real cache readers; replace only loading the compiled library.
+        library_path = Path(kwargs["kernel_lib_path"])
+        assert library_path.read_bytes() == library.read_bytes()
+        assert kwargs["kernel_global_source"] == "// mock kernel"
+        assert kwargs["params"] == [KernelParam(tuner_module.torch.float32, [1])]
+        restores.append(library_path)
+        kernel = create_kernel()
+        kernel.prim_func = kwargs["func"]
+        return kernel
+
+    monkeypatch.setattr(tilelang.JITKernel, "from_database", staticmethod(restore_kernel))
+    autotuner.jit_compile = compile_kernel
+    first = autotuner.run()
+    first_benchmarks = list(calls.benchmarks)
+    first_entries = set(autotuner.cache_dir.iterdir())
+    assert len(first_entries) == 1
+    assert compiles == [{"block": 32}]
+    assert first_benchmarks == [("kernel", 7, 11), ("reference", 7, 11)]
+
+    tuner_module.AutoTuner._memory_cache.clear()
+    fresh = tuner_module.AutoTuner(_factory, configs=[{"block": 32}])
+    fresh.set_compile_args(target="ascendc", platform="A3")
+    fresh.set_profile_args(warmup=7, rep=11, timeout=13, ref_prog=_reference, skip_check=True)
+    fresh.jit_compile = compile_kernel
+    restored = fresh.run()
+    assert restored is not first
+    assert restored.kernel is not first.kernel
+    assert (restored.config, restored.latency, restored.ref_latency, restored.libcode) == (
+        first.config,
+        first.latency,
+        first.ref_latency,
+        first.libcode,
+    )
+    assert restored.func(64) == 64
+    assert restored.kernel.latency == restored.latency
+    assert restored.kernel.config == restored.config
+    assert restored.kernel.ref_latency == restored.ref_latency
+    assert len(restores) == 1
+    assert calls.benchmarks == first_benchmarks
+    assert compiles == [{"block": 32}]
+    assert calls.timeouts == [13]
+
+    tuner_module.AutoTuner._memory_cache.clear()
+    changed = fresh.run(timeout=23)
+    assert changed is not restored
+    assert len(restores) == 1
+    assert calls.benchmarks == first_benchmarks * 2
+    assert compiles == [{"block": 32}, {"block": 32}]
+    assert calls.timeouts == [13, 23]
+    assert len(set(autotuner.cache_dir.iterdir()) - first_entries) == 1
 
 
 def test_decorator_populates_profile_args():

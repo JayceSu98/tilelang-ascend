@@ -3,8 +3,12 @@
 import importlib
 import inspect
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import cloudpickle
 import pytest
@@ -20,6 +24,112 @@ from tilelang.jit.adapter import libgen
 class Program:
     def script(self):
         return "run_mode_cache_regression"
+
+
+def _run_disk_cache_process(target: str, platform: str) -> None:
+    """Keep the public JIT and disk cache real; replace device build/load boundaries."""
+    from tilelang.engine.param import KernelParam
+
+    mode = os.environ["TL_RUN_MODE"]
+    cache = tilelang.cache._kernel_cache_instance
+    events = []
+    buffer = tilelang.tvm.tir.decl_buffer((16,), "float32", name="data")
+    program = tilelang.tvm.tir.PrimFunc(
+        [buffer.data],
+        tilelang.tvm.tir.Evaluate(0),
+        buffer_map={buffer.data: buffer},
+    ).with_attr("global_symbol", "run_mode_disk_cache")
+    source = program.script()
+
+    def adapter(path, params, event):
+        events.append(event)
+        artifact = json.loads(path.read_text())
+        assert artifact["mode"] == mode, f"Expected {mode} artifact, found {artifact['mode']} in {path}"
+        return SimpleNamespace(
+            func=lambda: None,
+            libpath=str(path),
+            params=params,
+            auto_gm_idx=[],
+            get_kernel_source=lambda: source,
+            artifact=artifact,
+        )
+
+    def build(self, func, out_idx, workspace_idx):
+        assert func.script() == source
+        params = [KernelParam.from_buffer(buffer)]
+        self.artifact = SimpleNamespace(kernel_source=source, params=params)
+        path = cache.cache_dir.parent / f"compiled-{mode}.so"
+        path.write_text(
+            json.dumps(
+                {
+                    # Also exercise the unfixed baseline, which has no run_mode attribute.
+                    "mode": getattr(self, "run_mode", mode),
+                    "target": self.target,
+                    "platform": self.platform,
+                    "compile_flags": self.compile_flags,
+                }
+            )
+        )
+        return adapter(path, params, "build")
+
+    def restore(self, **kwargs):
+        assert kwargs["func_or_mod"].script() == source
+        assert kwargs["kernel_global_source"] == source
+        assert kwargs["params"] == [KernelParam.from_buffer(buffer)]
+        result = adapter(Path(kwargs["kernel_lib_path"]), kwargs["params"], "restore")
+        assert result.artifact["mode"] == getattr(self, "run_mode", mode)
+        return result
+
+    with (
+        patch.object(kernel_module.JITKernel, "_compile_and_create_adapter", build),
+        patch.object(kernel_module.JITKernel, "_create_adapter_from_database", restore),
+    ):
+        kernel = tilelang.compile(program, target=target, platform=platform, compile_flags=["-O3"])
+    print(
+        json.dumps(
+            {
+                "events": events,
+                "artifact": kernel.adapter.artifact,
+                "keys": list(cache._memory_cache),
+                "program": source,
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("target,platform", [("ascendc", "A3"), ("pto", "A5")])
+def test_disk_cache_isolates_fixed_modes_across_processes(tmp_path, target, platform):
+    cache_dir = tmp_path / "cache"
+    env = os.environ.copy()
+    env["TILELANG_CACHE_DIR"] = str(cache_dir)
+    env["TILELANG_CLEAR_CACHE"] = "0"
+    env["PYTHONPATH"] = os.pathsep.join(str(Path(p or os.getcwd()).resolve()) for p in sys.path)
+    cold = {}
+    for mode, event in [("npu", "build"), ("sim", "build"), ("npu", "restore"), ("sim", "restore")]:
+        env["TL_RUN_MODE"] = mode
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), target, platform],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, f"{mode}/{event}:\n{result.stdout}\n{result.stderr}"
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        assert report["events"] == [event]
+        assert report["artifact"]["mode"] == mode
+        assert report["artifact"]["target"] == target
+        assert report["artifact"]["platform"] == platform
+        assert len(report["keys"]) == 1
+        if event == "build":
+            cold[mode] = report
+        else:
+            assert report["artifact"] == cold[mode]["artifact"]
+            assert report["keys"] == cold[mode]["keys"]
+        assert len(list(cache_dir.glob(f"*/{cache_module.KERNEL_LIB_PATH}"))) == len(cold)
+    assert cold["npu"]["program"] == cold["sim"]["program"]
+    assert cold["npu"]["artifact"]["compile_flags"] == cold["sim"]["artifact"]["compile_flags"]
+    assert cold["npu"]["keys"] != cold["sim"]["keys"]
 
 
 def _write_kernel_files(path):
@@ -285,3 +395,7 @@ def test_autotune_key_and_disk_restore_resolve_environment_on_call(monkeypatch, 
     result = autotune_param.AutotuneResult.load_from_disk(tmp_path, args)
     assert result is not None
     assert restored["run_mode"] == "sim"
+
+
+if __name__ == "__main__":
+    _run_disk_cache_process(*sys.argv[1:])

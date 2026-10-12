@@ -79,6 +79,26 @@ def test_unhashable_tuning_parameters_reach_factory(compiled_programs, first, se
     assert compiled_programs == [(1024, first), (1024, second)]
 
 
+def test_mutated_tuning_list_reenters_factory(compiled_programs):
+    generated = []
+
+    @jit_module.jit(target="ascendc", platform="A3")
+    def factory(n, tile_shape):
+        program = (n, tuple(tile_shape))
+        generated.append(program)
+        return program
+
+    tile_shape = [64, 32]
+    tuning_params = {"tile_shape": tile_shape}
+    first = factory(1024, __tune_params=tuning_params)
+    tile_shape[0] = 128
+    second = factory(1024, __tune_params=tuning_params)
+
+    assert first.program == (1024, (64, 32))
+    assert second.program == (1024, (128, 32))
+    assert generated == compiled_programs == [(1024, (64, 32)), (1024, (128, 32))]
+
+
 def test_unhashable_parameters_preserve_factory_errors(compiled_programs):
     @jit_module.jit(target="ascendc", platform="A3")
     def factory(n, tile_shape):

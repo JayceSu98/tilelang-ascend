@@ -1,4 +1,4 @@
-"""Ascend cache entries, linker commands and restored libraries share one run mode."""
+"""Conservative cache isolation for the current mode-dependent Ascend link policy."""
 
 import importlib
 import inspect
@@ -27,7 +27,7 @@ class Program:
 
 
 def _run_disk_cache_process(target: str, platform: str) -> None:
-    """Keep the public JIT and disk cache real; replace device build/load boundaries."""
+    """Exercise disk isolation with mocked mode-dependent linked libraries."""
     from tilelang.engine.param import KernelParam
 
     mode = os.environ["TL_RUN_MODE"]
@@ -44,7 +44,7 @@ def _run_disk_cache_process(target: str, platform: str) -> None:
     def adapter(path, params, event):
         events.append(event)
         artifact = json.loads(path.read_text())
-        assert artifact["mode"] == mode, f"Expected {mode} artifact, found {artifact['mode']} in {path}"
+        assert artifact["mode"] == mode, f"Mock linked artifact: expected mode {mode}, found {artifact['mode']} in {path}"
         return SimpleNamespace(
             func=lambda: None,
             libpath=str(path),
@@ -59,6 +59,8 @@ def _run_disk_cache_process(target: str, platform: str) -> None:
         params = [KernelParam.from_buffer(buffer)]
         self.artifact = SimpleNamespace(kernel_source=source, params=params)
         path = cache.cache_dir.parent / f"compiled-{mode}.so"
+        # Model the current link policy with a mode-tagged mock artifact.
+        # This marker does not test ELF compatibility or CANN runtime interchangeability.
         path.write_text(
             json.dumps(
                 {
@@ -98,7 +100,7 @@ def _run_disk_cache_process(target: str, platform: str) -> None:
 
 
 @pytest.mark.parametrize("target,platform", [("ascendc", "A3"), ("pto", "A5")])
-def test_disk_cache_isolates_fixed_modes_across_processes(tmp_path, target, platform):
+def test_disk_cache_partitions_mock_link_variants_across_processes(tmp_path, target, platform):
     cache_dir = tmp_path / "cache"
     env = os.environ.copy()
     env["TILELANG_CACHE_DIR"] = str(cache_dir)
@@ -370,6 +372,8 @@ def test_autotune_key_and_disk_restore_resolve_environment_on_call(monkeypatch, 
     args = autotune_param.CompileArgs(target="ascendc", platform="A3")
     tuner.compile_args = args
     parameters = inspect.signature(factory).parameters
+    # Measurements depend on the runtime even when a binary can be reused.
+    # Keep the program and compile arguments identical while checking that policy.
     monkeypatch.setenv("TL_RUN_MODE", "npu")
     npu_key = tuner.generate_cache_key(parameters)
     monkeypatch.setenv("TL_RUN_MODE", "sim")

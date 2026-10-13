@@ -8,14 +8,34 @@ TileLang offers two public entry points:
 Both entry points accept `pass_configs` for TileLang compiler passes and
 `compile_flags` for extra Bisheng command-line options.
 
-## NPU and simulator cache isolation
+## Runtime selection and cached libraries
 
-Set `TL_RUN_MODE` before starting the process and keep it fixed for that process:
-`sim` selects camodel libraries; unset or other values retain the NPU runtime.
-The Ascend Cython build and cache-restore paths pass the resolved mode to the
-linker and loader. Kernel and autotuner cache keys include the mode, so NPU and
-simulator processes using these paths can share a cache directory without
-reusing each other's artifacts.
+The current `LibraryGenerator` links against `runtime` for NPU builds and
+`runtime_camodel` for simulator builds, adding simulator library paths and RPATH
+in the latter case. Kernel cache keys include `TL_RUN_MODE` to preserve that
+existing link policy when restoring a library. This conservative partition can
+compile the same device program twice; it does not establish that NPU and camodel
+require different device code or incompatible shared libraries.
+
+CANN's [msProf Kernel launch instructions](https://www.hiascend.com/document/detail/en/mindstudio/700/optools/Operatordevelopmenttools/atlasopdev_16_0082.html)
+describe simulation without recompilation by providing a `libruntime.so` symlink
+to `libruntime_camodel.so` and selecting it through the launch environment.
+Sharing a TileLang library through that mechanism still needs validation for the
+specific CANN version, target and host ABI. The current cache partition does not
+implement a runtime-neutral build path.
+
+Set `TL_RUN_MODE` and the runtime library search path before starting the process,
+and keep the mode fixed for that process. Only `sim` selects the existing camodel
+link path; other values retain the NPU path. Changing `LD_LIBRARY_PATH` after
+Python or `torch_npu` has loaded libraries is not a supported way to switch
+runtimes; see the [dynamic loader's search rules](https://man7.org/linux/man-pages/man3/dlopen.3.html).
+
+Autotune results also include the mode in their keys: a reusable binary does not
+make latency measurements or the best configuration interchangeable between
+runtimes. The current `AutotuneResult` format stores both measurements and a copy
+of the linked library, so this is result-bundle isolation, not separate binary
+and measurement caches. Loaded libraries, tensors and streams remain local to
+their process and runtime.
 
 The Cython JIT adapter requires the `torch_npu` integration and uses torch NPU
 tensors and streams. For A5 simulation on a host without a physical NPU, use the
@@ -23,6 +43,14 @@ camodel runner described in the
 [programming guide](../TileLang-Ascend%20Programming%20Guide.md).
 That runner initializes the simulator runtime, clears the cache, and builds
 through `tilelang.lower` and `LibraryGenerator`, bypassing the JIT kernel cache.
+
+Before replacing the current link policy with a shared-library build, validate
+one unchanged TileLang-generated `.so` in two independently launched processes.
+Record its hash, ELF dependencies and RPATH/RUNPATH, confirm the runtime libraries
+actually loaded, and check the same computation in both environments without
+another compiler invocation. Test the raw runtime ABI separately from Cython's
+`torch_npu` integration. Mode-tagged test artifacts only validate cache routing;
+they cannot establish whether a real CANN library is interchangeable.
 
 ## Kernel-scoped Bisheng flags
 
